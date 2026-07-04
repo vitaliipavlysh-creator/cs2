@@ -143,9 +143,13 @@ def check_blog(config, state):
 
 
 def send_pushover(config, title, message, emergency=True):
+    """Returns True on confirmed delivery, False on failure (never raises) -
+    so failures can be surfaced by callers that care (e.g. --test/--once
+    exiting non-zero, which makes a misconfigured secret show up as a failed
+    GitHub Actions run instead of a silently-successful one)."""
     cfg = config.get("pushover", {})
     if not cfg.get("enabled"):
-        return
+        return True
     data = {
         "token": cfg["api_token"],
         "user": cfg["user_key"],
@@ -177,8 +181,10 @@ def send_pushover(config, title, message, emergency=True):
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             log.info("Pushover response: %s", resp.status)
+            return True
     except Exception:
         log.exception("Failed to send Pushover notification")
+        return False
 
 
 def send_pushover_repeating(config, title, message):
@@ -188,18 +194,20 @@ def send_pushover_repeating(config, title, message):
     window - stop it early by acknowledging/killing the process if you wake up."""
     cfg = config.get("pushover", {})
     if not cfg.get("enabled"):
-        return
+        return None
     interval = cfg.get("repeat_interval_seconds", 15)
     duration = cfg.get("repeat_duration_seconds", 600)
     count = max(1, duration // interval)
+    results = []
 
     def _worker():
         for i in range(count):
-            send_pushover(config, title, message)
+            results.append(send_pushover(config, title, message))
             if i < count - 1:
                 time.sleep(interval)
 
     thread = threading.Thread(target=_worker, daemon=True)
+    thread.results = results
     thread.start()
     return thread
 
@@ -223,25 +231,29 @@ def send_twilio_call(config, message):
 
 
 def alert(config, title, message):
-    """Returns the repeat-worker thread if one was started, else None - lets
-    short-lived callers (e.g. GitHub Actions `--once` runs) wait for the
-    repeat sequence to actually finish before the process exits."""
+    """Returns a Thread if a repeat sequence was started (caller should join
+    it before exiting), or a bool if it was a single direct send - lets
+    short-lived callers (e.g. GitHub Actions `--once`/`--test` runs) detect
+    and surface delivery failures instead of exiting 0 regardless."""
     log.info("ALERT: %s | %s", title, message)
-    thread = None
     cfg = config.get("pushover", {})
     if cfg.get("priority_mode") == "normal" and cfg.get("repeat_if_normal", True):
-        thread = send_pushover_repeating(config, title, message)
+        result = send_pushover_repeating(config, title, message)
     else:
-        send_pushover(config, title, message, emergency=True)
+        result = send_pushover(config, title, message, emergency=True)
     send_twilio_call(config, message)
-    return thread
+    return result
 
 
 def run_test(config):
     # Single one-off push, not the full repeat-for-10-minutes behavior real
     # alerts use - so repeated manual `--test` runs don't stack up spam.
-    send_pushover(config, "CS2 monitor test", "This is a test alert. If you got this loudly, you're set up correctly.")
-    log.info("Test alert sent.")
+    ok = send_pushover(config, "CS2 monitor test", "This is a test alert. If you got this loudly, you're set up correctly.")
+    if ok:
+        log.info("Test alert sent.")
+    else:
+        log.error("Test alert FAILED to send - check Pushover credentials.")
+        sys.exit(1)
 
 
 def run_test_repeat(config):
@@ -260,27 +272,32 @@ def run_once(config, state):
     """Single check-and-exit cycle, for ephemeral runners (GitHub Actions)
     that don't keep a process alive between scheduled invocations."""
     threads = []
+    any_failed = False
 
     changed, build_info = check_build(config, state)
     if changed:
-        t = alert(
+        result = alert(
             config,
             "CS2 UPDATE IS LIVE",
             f"Build changed {build_info['old_buildid']} -> {build_info['new_buildid']}. Get in there now.",
         )
-        if t:
-            threads.append(t)
+        if isinstance(result, threading.Thread):
+            threads.append(result)
+        elif result is False:
+            any_failed = True
 
     new_posts = check_blog(config, state)
     for entry in new_posts:
         if entry["matched_keyword"]:
-            t = alert(
+            result = alert(
                 config,
                 "CS2 blog: possible Armory Pass post",
                 f"{entry['title']}\n{entry['link']}",
             )
-            if t:
-                threads.append(t)
+            if isinstance(result, threading.Thread):
+                threads.append(result)
+            elif result is False:
+                any_failed = True
         else:
             log.info("New blog post (no keyword match): %s", entry["title"])
 
@@ -290,6 +307,12 @@ def run_once(config, state):
     # process would exit and kill them after just one push.
     for t in threads:
         t.join()
+        if hasattr(t, "results") and t.results and not any(t.results):
+            any_failed = True
+
+    if any_failed:
+        log.error("At least one alert failed to deliver - failing the run so it's visible.")
+        sys.exit(1)
 
     log.info("Single check complete.")
 
