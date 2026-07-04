@@ -7,9 +7,8 @@ Polls two independent public signals for a new Counter-Strike 2 update:
   2. The official Counter-Strike blog RSS feed - usually gets a patch-notes post
      around the same time, and lets us flag posts mentioning "Armory Pass".
 
-On either signal changing, fires a Pushover "emergency" notification (siren
-sound, repeats until acknowledged, bypasses silent mode) and/or triggers an
-outbound phone call via Twilio, depending on what's enabled in config.json.
+On either signal changing, fires a Pushover notification (and/or triggers an
+outbound phone call via Twilio) depending on what's enabled in config.json.
 
 State (last seen buildid / RSS guids) is persisted to state.json so a
 restart doesn't cause a false trigger or miss a change that happened while
@@ -86,13 +85,17 @@ def load_config():
     return config
 
 
+def parse_build_info(raw):
+    """Pure parsing of the api.steamcmd.net response. Returns (buildid, timeupdated)."""
+    data = json.loads(raw)
+    branch = data["data"]["730"]["depots"]["branches"]["public"]
+    return branch["buildid"], branch.get("timeupdated")
+
+
 def check_build(config, state):
     """Returns (changed: bool, info: dict|None)"""
     raw = http_get(STEAMCMD_INFO_URL)
-    data = json.loads(raw)
-    branch = data["data"]["730"]["depots"]["branches"]["public"]
-    buildid = branch["buildid"]
-    timeupdated = branch.get("timeupdated")
+    buildid, timeupdated = parse_build_info(raw)
 
     last_buildid = state.get("last_buildid")
     if last_buildid is None:
@@ -111,45 +114,51 @@ def check_build(config, state):
     return False, None
 
 
-def check_blog(config, state):
-    """Returns list of new entries: [{title, link, matched_keyword}]"""
-    raw = http_get(CS_BLOG_FEED_URL)
+def parse_blog_items(raw):
+    """Pure parsing of the CS blog RSS feed. Returns [{guid, title, link}, ...]."""
     root = ET.fromstring(raw)
-    seen_guids = set(state.get("seen_guids", []))
-    new_entries = []
-
-    items = root.findall("./channel/item")
-    for item in items:
+    items = []
+    for item in root.findall("./channel/item"):
         guid_el = item.find("guid")
         link_el = item.find("link")
         title_el = item.find("title")
         guid = (guid_el.text if guid_el is not None else None) or (link_el.text if link_el is not None else None)
+        title = title_el.text if title_el is not None else "(no title)"
+        link = link_el.text if link_el is not None else ""
+        items.append({"guid": guid, "title": title, "link": link})
+    return items
+
+
+def match_keyword(title):
+    lowered = title.lower()
+    return next((kw for kw in KEYWORDS if kw in lowered), None)
+
+
+def check_blog(config, state):
+    """Returns list of new entries: [{title, link, matched_keyword}]"""
+    raw = http_get(CS_BLOG_FEED_URL)
+    items = parse_blog_items(raw)
+    seen_guids = set(state.get("seen_guids", []))
+    is_first_run = "seen_guids" not in state
+    new_entries = []
+
+    for item in items:
+        guid = item["guid"]
         if not guid or guid in seen_guids:
             continue
         seen_guids.add(guid)
-        title = title_el.text if title_el is not None else "(no title)"
-        link = link_el.text if link_el is not None else ""
-        lowered = title.lower()
-        matched = next((kw for kw in KEYWORDS if kw in lowered), None)
-        new_entries.append({"title": title, "link": link, "matched_keyword": matched})
-
-    # First run: don't flood with every historical post, just record them.
-    if "seen_guids" not in state:
-        state["seen_guids"] = list(seen_guids)
-        return []
+        new_entries.append(
+            {"title": item["title"], "link": item["link"], "matched_keyword": match_keyword(item["title"])}
+        )
 
     state["seen_guids"] = list(seen_guids)
-    return new_entries
+
+    # First run: don't flood with every historical post, just record them.
+    return [] if is_first_run else new_entries
 
 
-def send_pushover(config, title, message, emergency=True):
-    """Returns True on confirmed delivery, False on failure (never raises) -
-    so failures can be surfaced by callers that care (e.g. --test/--once
-    exiting non-zero, which makes a misconfigured secret show up as a failed
-    GitHub Actions run instead of a silently-successful one)."""
-    cfg = config.get("pushover", {})
-    if not cfg.get("enabled"):
-        return True
+def build_pushover_payload(cfg, title, message, emergency=True):
+    """Pure construction of the Pushover API request body from config."""
     data = {
         "token": cfg["api_token"],
         "user": cfg["user_key"],
@@ -172,6 +181,19 @@ def send_pushover(config, title, message, emergency=True):
     else:
         data["priority"] = 0
 
+    return data
+
+
+def send_pushover(config, title, message, emergency=True):
+    """Returns True on confirmed delivery, False on failure (never raises) -
+    so failures can be surfaced by callers that care (e.g. --test/--once
+    exiting non-zero, which makes a misconfigured secret show up as a failed
+    GitHub Actions run instead of a silently-successful one)."""
+    cfg = config.get("pushover", {})
+    if not cfg.get("enabled"):
+        return True
+
+    data = build_pushover_payload(cfg, title, message, emergency)
     body = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in data.items())
     req = urllib.request.Request(
         "https://api.pushover.net/1/messages.json",
@@ -268,16 +290,12 @@ def run_test_repeat(config):
     log.info("Repeat test done.")
 
 
-def run_once(config, state):
-    """Single check-and-exit cycle, for ephemeral runners (GitHub Actions)
-    that don't keep a process alive between scheduled invocations."""
+def run_poll_cycle(config, state):
+    """Runs one check-and-alert cycle against the given state (mutated in
+    place). Returns True if everything that needed to be sent was delivered
+    successfully (or nothing needed sending), False if any alert failed."""
     threads = []
     any_failed = False
-
-    # Always touch state so state.json changes and gets committed every run,
-    # even when build/blog are unchanged - keeps the repo "active" so GitHub
-    # never auto-disables the scheduled workflow for 60 days of inactivity.
-    state["last_checked_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     changed, build_info = check_build(config, state)
     if changed:
@@ -306,16 +324,28 @@ def run_once(config, state):
         else:
             log.info("New blog post (no keyword match): %s", entry["title"])
 
-    save_json(STATE_PATH, state)
-
-    # Block until any repeat-notification threads finish, otherwise the
-    # process would exit and kill them after just one push.
+    # Block until any repeat-notification threads finish, otherwise a
+    # short-lived caller (GitHub Actions) would exit and kill them early.
     for t in threads:
         t.join()
         if hasattr(t, "results") and t.results and not any(t.results):
             any_failed = True
 
-    if any_failed:
+    return not any_failed
+
+
+def run_once(config, state):
+    """Single check-and-exit cycle, for ephemeral runners (GitHub Actions)
+    that don't keep a process alive between scheduled invocations."""
+    # Always touch state so state.json changes and gets committed every run,
+    # even when build/blog are unchanged - keeps the repo "active" so GitHub
+    # never auto-disables the scheduled workflow for 60 days of inactivity.
+    state["last_checked_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    ok = run_poll_cycle(config, state)
+    save_json(STATE_PATH, state)
+
+    if not ok:
         log.error("At least one alert failed to deliver - failing the run so it's visible.")
         sys.exit(1)
 
@@ -351,27 +381,13 @@ def main():
                 log.info("Heartbeat: still polling, last known buildid=%s", state.get("last_buildid"))
                 last_heartbeat = now
 
-            changed, build_info = check_build(config, state)
-            if changed:
-                alert(
-                    config,
-                    "CS2 UPDATE IS LIVE",
-                    f"Build changed {build_info['old_buildid']} -> {build_info['new_buildid']}. Get in there now.",
-                )
-
-            new_posts = check_blog(config, state)
-            for entry in new_posts:
-                if entry["matched_keyword"]:
-                    alert(
-                        config,
-                        "CS2 blog: possible Armory Pass post",
-                        f"{entry['title']}\n{entry['link']}",
-                    )
-                else:
-                    log.info("New blog post (no keyword match): %s", entry["title"])
-
+            ok = run_poll_cycle(config, state)
             save_json(STATE_PATH, state)
-            consecutive_failures = 0
+            if ok:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                log.error("Poll cycle had delivery failures (%d consecutive)", consecutive_failures)
         except Exception:
             consecutive_failures += 1
             log.exception("Poll cycle failed (%d consecutive failures)", consecutive_failures)

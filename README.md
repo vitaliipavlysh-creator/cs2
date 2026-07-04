@@ -113,6 +113,19 @@ run a few minutes late during busy periods).
    60 days with zero commits to the repo, but since every run commits `state.json`,
    that resets the clock automatically as long as it keeps running successfully.
 
+## Tests
+
+The pure logic (parsing, payload building, poll-cycle orchestration) is covered by
+unit tests, with network calls mocked out - no real Pushover/Steam/blog traffic:
+
+```
+pip install -r requirements-dev.txt
+python -m pytest -v
+```
+
+[.github/workflows/tests.yml](.github/workflows/tests.yml) runs the suite automatically
+on every push that touches `monitor.py` or the tests.
+
 ## Notes / limitations
 
 - This can only alert you as fast as `poll_interval_seconds` (default 60s) plus
