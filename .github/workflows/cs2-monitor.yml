@@ -3,7 +3,17 @@ name: CS2 Update Monitor
 on:
   schedule:
     - cron: "*/10 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "once = normal poll cycle, test = send one test push, test-repeat = send a short repeat-test"
+        required: false
+        default: "once"
+        type: choice
+        options:
+          - once
+          - test
+          - test-repeat
 
 permissions:
   contents: write
@@ -22,13 +32,14 @@ jobs:
         with:
           python-version: "3.x"
 
-      - name: Run single check
+      - name: Run
         env:
           PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
           PUSHOVER_API_TOKEN: ${{ secrets.PUSHOVER_API_TOKEN }}
-        run: python monitor.py --once
+        run: python monitor.py --${{ inputs.mode || 'once' }}
 
       - name: Commit updated state
+        if: ${{ (inputs.mode || 'once') == 'once' }}
         run: |
           git config user.name "cs2-monitor-bot"
           git config user.email "actions@users.noreply.github.com"
