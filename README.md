@@ -113,6 +113,30 @@ run a few minutes late during busy periods).
    60 days with zero commits to the repo, but since every run commits `state.json`,
    that resets the clock automatically as long as it keeps running successfully.
 
+### External pinger (used because native cron proved unreliable)
+
+In practice GitHub's native `on: schedule` cron fired only once in ~4 hours for
+this fresh repo, so the schedule is instead driven by an external pinger at
+[cron-job.org](https://cron-job.org) (job "CS2 monitor pinger"), which POSTs to
+
+```
+https://api.github.com/repos/vitaliipavlysh-creator/cs2/actions/workflows/cs2-monitor.yml/dispatches
+```
+
+every 10 minutes with body `{"ref":"main","inputs":{"mode":"once"}}` and headers
+`Authorization: Bearer <fine-grained PAT>`, `Accept: application/vnd.github+json`,
+`Content-Type: application/json`.
+
+- The PAT is fine-grained: access to only this repo, only Actions read/write.
+  If it expires or gets revoked, pings start returning 401 - create a new token
+  at github.com/settings/personal-access-tokens and update the cronjob's
+  Authorization header on cron-job.org.
+- The native `schedule:` trigger in the workflow is left enabled as a free
+  bonus - if it ever stabilizes, duplicate triggers are harmless (the
+  `concurrency` group serializes runs, and an unchanged state produces no commit).
+- To check pinger health: cron-job.org dashboard -> job history shows the HTTP
+  status of each ping (204 = success, 401 = bad/expired token).
+
 ## Tests
 
 The pure logic (parsing, payload building, poll-cycle orchestration) is covered by
