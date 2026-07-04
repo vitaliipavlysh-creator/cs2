@@ -274,6 +274,11 @@ def run_once(config, state):
     threads = []
     any_failed = False
 
+    # Always touch state so state.json changes and gets committed every run,
+    # even when build/blog are unchanged - keeps the repo "active" so GitHub
+    # never auto-disables the scheduled workflow for 60 days of inactivity.
+    state["last_checked_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
     changed, build_info = check_build(config, state)
     if changed:
         result = alert(
