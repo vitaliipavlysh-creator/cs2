@@ -43,6 +43,21 @@ jobs:
         run: |
           git config user.name "cs2-monitor-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add state.json
-          git diff --cached --quiet || git commit -m "Update monitor state [skip ci]"
+          commit_state() {
+            git add state.json
+            git diff --cached --quiet || git commit -m "Update monitor state [skip ci]"
+          }
+          commit_state
+          for i in 1 2 3; do
+            if git push; then exit 0; fi
+            # Someone pushed to the repo while this run was in flight (alert
+            # runs hold their checkout for minutes while the notification
+            # series plays out) - take the latest remote and re-apply our
+            # freshly generated state.json on top of it, then retry.
+            cp state.json /tmp/state.json.new
+            git fetch origin main
+            git reset --hard FETCH_HEAD
+            cp /tmp/state.json.new state.json
+            commit_state
+          done
           git push
