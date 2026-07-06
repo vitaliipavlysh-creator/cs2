@@ -268,8 +268,8 @@ def alert(config, title, message):
 
 
 def run_test(config):
-    # Single one-off push, not the full repeat-for-10-minutes behavior real
-    # alerts use - so repeated manual `--test` runs don't stack up spam.
+    # Single one-off push, not the full repeating behavior real alerts
+    # use - so repeated manual `--test` runs don't stack up spam.
     ok = send_pushover(config, "CS2 monitor test", "This is a test alert. If you got this loudly, you're set up correctly.")
     if ok:
         log.info("Test alert sent.")

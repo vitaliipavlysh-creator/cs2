@@ -9,7 +9,7 @@
     "priority_mode": "normal",
     "repeat_if_normal": true,
     "repeat_interval_seconds": 15,
-    "repeat_duration_seconds": 600
+    "repeat_duration_seconds": 300
   },
   "twilio": {
     "enabled": false,
